@@ -44,16 +44,23 @@ def get_tool_handler(name: str) -> tools.ToolHandler | None:
 add_tool_handler(tools.ListFilesInDirToolHandler())
 add_tool_handler(tools.ListFilesInVaultToolHandler())
 add_tool_handler(tools.GetFileContentsToolHandler())
+add_tool_handler(tools.GetSectionContentToolHandler())
 add_tool_handler(tools.SearchToolHandler())
 add_tool_handler(tools.PatchContentToolHandler())
 add_tool_handler(tools.AppendContentToolHandler())
-add_tool_handler(tools.PutContentToolHandler())
+# PutContentToolHandler intentionally not registered — append/patch cover its use cases
+# add_tool_handler(tools.PutContentToolHandler())
+add_tool_handler(tools.SectionIntroPatchToolHandler())
+add_tool_handler(tools.ListHeadingsToolHandler())
 add_tool_handler(tools.DeleteFileToolHandler())
 add_tool_handler(tools.ComplexSearchToolHandler())
 add_tool_handler(tools.BatchGetFileContentsToolHandler())
-add_tool_handler(tools.PeriodicNotesToolHandler())
-add_tool_handler(tools.RecentPeriodicNotesToolHandler())
-add_tool_handler(tools.RecentChangesToolHandler())
+# PeriodicNotesToolHandler / RecentPeriodicNotesToolHandler / RecentChangesToolHandler
+# intentionally not registered — periodic-note workflow and ad-hoc recent-changes
+# lookups are unused in this harness. Re-enable by uncommenting if needed.
+# add_tool_handler(tools.PeriodicNotesToolHandler())
+# add_tool_handler(tools.RecentPeriodicNotesToolHandler())
+# add_tool_handler(tools.RecentChangesToolHandler())
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:

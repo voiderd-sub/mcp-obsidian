@@ -1,7 +1,7 @@
 [project]
 name = "mcp-obsidian"
-version = "0.2.1"
-description = "MCP server to work with Obsidian via the remote REST plugin"
+version = "0.3.0"
+description = "MCP server for Obsidian via the Local REST API plugin — harness-engineered fork with agent-safety gates, lenient heading paths, and healing errors."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,9 +9,22 @@ dependencies = [
  "python-dotenv>=1.0.1",
  "requests>=2.32.3",
 ]
+
+# Original author retained from upstream (https://github.com/MarkusPfundstein/mcp-obsidian).
+# Fork maintainer added below.
 [[project.authors]]
 name = "Markus Pfundstein"
 email = "markus@life-electronic.nl"
+
+[[project.authors]]
+name = "voiderd-sub"
+email = "vvoider01@gmail.com"
+
+[project.urls]
+Homepage = "https://github.com/voiderd-sub/mcp-obsidian"
+Repository = "https://github.com/voiderd-sub/mcp-obsidian"
+Issues = "https://github.com/voiderd-sub/mcp-obsidian/issues"
+Upstream = "https://github.com/MarkusPfundstein/mcp-obsidian"
 
 [build-system]
 requires = [ "hatchling",]

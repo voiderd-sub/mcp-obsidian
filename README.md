@@ -1,22 +1,69 @@
-# MCP server for Obsidian
+# MCP server for Obsidian (harness-engineered fork)
 
 MCP server to interact with Obsidian via the Local REST API community plugin.
 
+> **Fork notice**
+> This is a personal fork of [MarkusPfundstein/mcp-obsidian](https://github.com/MarkusPfundstein/mcp-obsidian), redesigned for use as a long-lived agent harness. The tool surface has been reshaped so the agent makes fewer mistakes by construction (instead of relying on long system-prompt rules to prevent them). See [What's different from upstream](#whats-different-from-upstream) below.
+>
+> Upstream is the source of truth for the underlying REST integration; changes here focus on agent ergonomics, safety gating, and token efficiency.
+
 <a href="https://glama.ai/mcp/servers/3wko1bhuek"><img width="380" height="200" src="https://glama.ai/mcp/servers/3wko1bhuek/badge" alt="server for Obsidian MCP server" /></a>
+
+## What's different from upstream
+
+Reshaping was driven by [Anthropic's "Writing tools for agents"](https://www.anthropic.com/engineering/writing-tools-for-agents) — the goal is **make invalid states unrepresentable at the tool surface** rather than enforce them via prompt rules. Concretely:
+
+### Safety gates
+
+- **`patch_content (heading, replace)` is gated when the target heading has children.** Without `confirm_wipe=true`, the call is rejected with a redirect to `section_intro_patch`. This eliminates the most common destructive accident: replacing a heading's intro and silently wiping all sub-sections.
+- **`delete_file` description and schema reflect that it is destructive and irreversible.** `confirm` is now an enum `[true]` so accidental defaults can't fire it. The description explicitly tells the agent not to use it as a workaround for failed writes.
+
+### Heading-path leniency + healing
+
+- **`patch_content` and `section_intro_patch` accept lenient heading paths.** Leading `#` and whitespace per segment are stripped, and partial paths like `Sub` or `Sub::Leaf` are auto-resolved to the full root-anchored path if the match is unique. Agents no longer need to construct `Top H1::Sub H2` from scratch.
+- **On heading-path miss or ambiguity, the file's heading tree is appended to the error.** The agent gets the data it needs to self-correct on the next call instead of looping or escalating to deletion.
+
+### New tools
+
+- **`section_intro_patch`** — surgical edit of a heading's intro region (between the heading and its first child). Children are preserved. Marked PREFERRED in description for editing under any heading with children.
+- **`list_headings`** — returns the heading tree of a single file as an indented outline. Cheap proactive recon before patching, typically 1–5% of full-file token cost.
+- **`get_section_content`** — returns the content under a single heading (heading line + body + descendants). Replaces full-file reads when only one section is needed.
+
+### Token efficiency
+
+- **JSON-wrapped read responses changed to plain text where appropriate.** `get_file_contents` returned `json.dumps(content)`, which double-encoded the markdown body. Now returns raw markdown.
+- **`ensure_ascii=False` on remaining JSON responses.** Korean/CJK content is no longer Unicode-escaped — significant token savings for non-English vaults.
+- **`limit` parameters added to listing and search tools** (`list_files_in_vault`, `list_files_in_dir`, `simple_search`, `complex_search`). Truncation appends a hint suggesting how to narrow the query.
+- **`get_file_contents` line slicing**: `start_line` / `line_limit` parameters for partial reads of large files, plus a warning when a single line exceeds 5000 chars.
+- **`batch_get_file_contents` total-char cap** (`max_total_chars`, default 50000) with a skip notice when reached.
+
+### Removed / restricted
+
+- `put_content` (full-file overwrite) is intentionally **not registered**. Use `append_content` (creates if missing) or `section_intro_patch` instead. Removing the surface eliminates the "rewrite the whole file" misuse pattern.
+- `get_periodic_note`, `get_recent_periodic_notes`, and `get_recent_changes` are **not registered** — the periodic-note workflow (daily/weekly/monthly/quarterly/yearly notes) and ad-hoc "recent changes" lookups are unused in this harness. All three classes remain in `tools.py`; re-enable by uncommenting one line in `server.py`.
+- `complex_search` description trimmed (examples were duplicated between the body and the parameter description).
+
+### What stays the same
+
+- All upstream tools that were not explicitly changed above keep their existing behavior and signatures.
+- The underlying REST integration in `obsidian.py` is unchanged in intent — the helpers in `markdown_section.py` parse markdown locally to enable the leniency / gating features without relying on REST endpoints that don't exist.
 
 ## Components
 
 ### Tools
 
-The server implements multiple tools to interact with Obsidian:
-
-- list_files_in_vault: Lists all files and directories in the root directory of your Obsidian vault
-- list_files_in_dir: Lists all files and directories in a specific Obsidian directory
-- get_file_contents: Return the content of a single file in your vault.
-- search: Search for documents matching a specified text query across all files in the vault
-- patch_content: Insert content into an existing note relative to a heading, block reference, or frontmatter field.
-- append_content: Append content to a new or existing file in the vault.
-- delete_file: Delete a file or directory from your vault.
+- **list_files_in_vault** — Lists files and directories in the vault root (alphabetically sorted, `limit`-truncated).
+- **list_files_in_dir** — Lists files and directories in a specific subdirectory.
+- **get_file_contents** — Returns a single file's content. Optional `start_line` / `line_limit` for slicing.
+- **get_section_content** — Returns the content under one heading (heading + body + descendants). For large files, prefer this over `get_file_contents`.
+- **list_headings** — Returns a file's heading tree as an indented outline. Cheap recon before patching.
+- **batch_get_file_contents** — Concatenates multiple files with `# {filepath}` headers, capped by `max_total_chars`.
+- **simple_search** — Text search across the vault, `limit`-truncated.
+- **complex_search** — JsonLogic search (glob, regexp on path/content), `limit`-truncated.
+- **append_content** — Appends content to a file (creates if missing).
+- **patch_content** — Inserts content relative to a heading / block ref / frontmatter field. Lenient heading paths, healing on miss, `confirm_wipe` gate on destructive `(heading, replace)` calls.
+- **section_intro_patch** — Surgical edit of a heading's intro region only. Preserves child sub-headings. **Preferred** for any edit under a heading with children.
+- **delete_file** — Permanently removes a file. `confirm: true` required. Use only on explicit user request.
 
 ### Example prompts
 
@@ -106,27 +153,7 @@ On Windows: `%APPDATA%/Claude/claude_desktop_config.json`
 ```
 </details>
 
-<details>
-  <summary>Published Servers Configuration</summary>
-  
-```json
-{
-  "mcpServers": {
-    "mcp-obsidian": {
-      "command": "uvx",
-      "args": [
-        "mcp-obsidian"
-      ],
-      "env": {
-        "OBSIDIAN_API_KEY": "<YOUR_OBSIDIAN_API_KEY>",
-        "OBSIDIAN_HOST": "<your_obsidian_host>",
-        "OBSIDIAN_PORT": "<your_obsidian_port>"
-      }
-    }
-  }
-}
-```
-</details>
+> **Note**: this fork is not published to PyPI, so the upstream `uvx mcp-obsidian` published-server install does not apply. Use the development configuration above (`uv --directory <path> run mcp-obsidian`) pointing at your local clone of this fork.
 
 ## Development
 
