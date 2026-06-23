@@ -23,6 +23,11 @@ section_region = _mod.section_region
 heading_has_children = _mod.heading_has_children
 count_descendant_headings = _mod.count_descendant_headings
 resolve_to_full_path = _mod.resolve_to_full_path
+apply_section_op = _mod.apply_section_op
+rename_heading = _mod.rename_heading
+delete_section = _mod.delete_section
+heading_level = _mod.heading_level
+leading_heading_level = _mod.leading_heading_level
 
 
 # ----------------------------------------------------------------- intro_region
@@ -389,6 +394,192 @@ def test_resolve_full_path_missing_raises():
 def test_resolve_full_path_deeply_nested_unique_leaf():
     text = "# A\n## B\n### C\n#### D\nx\n"
     assert resolve_to_full_path(text, "D") == "A::B::C::D"
+
+
+# --------------------------------------------------------------- apply_section_op
+
+
+def test_apply_section_op_replace_wipes_children():
+    text = (
+        "# Top\n"
+        "intro\n"
+        "## Child\n"
+        "child body\n"
+        "# Sibling\n"
+        "s\n"
+    )
+    out = apply_section_op(text, "Top", "replace", "brand new body")
+    assert out == (
+        "# Top\n"
+        "brand new body\n"
+        "# Sibling\n"
+        "s\n"
+    )
+
+
+def test_apply_section_op_append_after_children():
+    text = (
+        "# Top\n"
+        "intro\n"
+        "## Child\n"
+        "child body\n"
+        "# Sibling\n"
+    )
+    out = apply_section_op(text, "Top", "append", "appended")
+    assert out == (
+        "# Top\n"
+        "intro\n"
+        "## Child\n"
+        "child body\n"
+        "appended\n"
+        "# Sibling\n"
+    )
+
+
+def test_apply_section_op_prepend_after_heading():
+    text = "# Top\nintro\n## Child\nc\n"
+    out = apply_section_op(text, "Top", "prepend", "new top")
+    assert out == "# Top\nnew top\nintro\n## Child\nc\n"
+
+
+def test_apply_section_op_replace_no_children():
+    text = "# Only\nold\n"
+    out = apply_section_op(text, "Only", "replace", "new")
+    assert out == "# Only\nnew\n"
+
+
+def test_apply_intro_op_append_no_trailing_newline():
+    # File whose last line lacks a trailing newline must not glue onto content.
+    text = "# H\n- bullet1"
+    out = apply_intro_op(text, "H", "append", "- bullet2")
+    assert out == "# H\n- bullet1\n- bullet2\n"
+
+
+def test_apply_section_op_append_no_trailing_newline():
+    text = "# H\n- b1\n## Child\nx"
+    out = apply_section_op(text, "H", "append", "- b2")
+    assert out == "# H\n- b1\n## Child\nx\n- b2\n"
+
+
+def test_apply_section_op_cjk_heading():
+    text = "# 대시보드\n## 진행 중\n할 일\n### 프로젝트 A\n상세\n"
+    out = apply_section_op(text, "대시보드::진행 중", "replace", "새 본문")
+    assert "## 진행 중\n새 본문\n" in out
+    assert "프로젝트 A" not in out
+    assert "# 대시보드" in out
+
+
+# --------------------------------------------------------------- rename_heading
+
+
+def test_rename_heading_preserves_level_and_children():
+    text = "# Top\n## Old Name\nbody\n### Sub\nx\n"
+    out = rename_heading(text, "Top::Old Name", "New Name")
+    assert "## New Name\n" in out
+    assert "Old Name" not in out
+    assert "### Sub\nx\n" in out
+    assert "body\n" in out
+
+
+def test_rename_heading_cjk():
+    text = "# 문서\n## 사화 fix\n내용\n"
+    out = rename_heading(text, "사화 fix", "사용 fix")
+    assert "## 사용 fix\n" in out
+    assert "사화" not in out
+
+
+def test_rename_heading_normalizes_new_title():
+    text = "# A\n## B\n"
+    out = rename_heading(text, "B", "## C")
+    assert "## C\n" in out
+    assert "## ## C" not in out
+
+
+def test_rename_heading_missing_raises():
+    try:
+        rename_heading("# A\nbody\n", "Nope", "X")
+    except ValueError:
+        pass
+    else:
+        assert False, "expected ValueError"
+
+
+def test_rename_heading_empty_title_raises():
+    try:
+        rename_heading("# A\n", "A", "##")
+    except ValueError:
+        pass
+    else:
+        assert False, "expected ValueError"
+
+
+# --------------------------------------------------------------- delete_section
+
+
+def test_delete_section_removes_section_and_descendants():
+    text = (
+        "# Top\n"
+        "intro\n"
+        "## A\n"
+        "a body\n"
+        "### A1\n"
+        "x\n"
+        "## B\n"
+        "b body\n"
+    )
+    out = delete_section(text, "Top::A")
+    assert "## A\n" not in out
+    assert "### A1" not in out
+    assert "a body" not in out
+    assert "## B\nb body\n" in out
+    assert "# Top\nintro\n" in out
+
+
+def test_delete_section_runs_to_eof():
+    text = "# Top\n## A\nx\n## Last\ny\n"
+    out = delete_section(text, "Last")
+    assert "## Last" not in out
+    assert out == "# Top\n## A\nx\n"
+
+
+# --------------------------------------------------------------- heading_level
+
+
+def test_heading_level():
+    text = "# A\n## B\n### C\n"
+    assert heading_level(text, "A") == 1
+    assert heading_level(text, "A::B") == 2
+    assert heading_level(text, "A::B::C") == 3
+
+
+def test_heading_level_missing_raises():
+    try:
+        heading_level("# A\n", "B")
+    except ValueError:
+        pass
+    else:
+        assert False, "expected ValueError"
+
+
+# ----------------------------------------------------------- leading_heading_level
+
+
+def test_leading_heading_level_heading_first():
+    assert leading_heading_level("## New\nbody\n") == 2
+    assert leading_heading_level("# Title") == 1
+
+
+def test_leading_heading_level_prose():
+    assert leading_heading_level("just text\n## later\n") is None
+
+
+def test_leading_heading_level_skips_blank():
+    assert leading_heading_level("\n\n### Deep\n") == 3
+
+
+def test_leading_heading_level_empty():
+    assert leading_heading_level("") is None
+    assert leading_heading_level("\n   \n") is None
 
 
 if __name__ == "__main__":

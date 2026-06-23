@@ -349,24 +349,28 @@ class PatchContentToolHandler(ToolHandler):
                "Heading paths use '::' delimiter (e.g. 'Top H1::Sub H2'). "
                "Lenient parsing — leading '#' and whitespace are stripped, "
                "and partial paths (single name like 'Sub' or partial chain "
-               "like 'Sub::Leaf') are auto-resolved to the full root-anchored "
-               "path if the match is unique. On miss or ambiguity, the file's "
-               "heading tree is returned in the error for self-correction.\n\n"
-               "When target_type='heading' and operation='replace': if the "
-               "target heading has child sub-headings, this would wipe them. "
-               "The tool requires confirm_wipe=true in that case. To overwrite "
-               "a heading's intro while preserving children, use "
-               "obsidian_section_intro_patch (operation='replace') instead.\n\n"
+               "like 'Sub::Leaf') are auto-resolved if the match is unique. "
+               "On miss or ambiguity, the file's heading tree is returned in "
+               "the error for self-correction.\n\n"
+               "IMPORTANT: every operation edits only the BODY under a heading "
+               "— the heading line itself is NEVER changed. Putting a heading "
+               "line ('## ...') into `content` does NOT rename the heading; it "
+               "creates a duplicate (the tool rejects this). To rename a "
+               "heading use obsidian_rename_heading; to remove a whole section "
+               "use obsidian_delete_section.\n\n"
+               "For target_type='heading', `scope` selects how much is edited:\n"
+               "  - scope='intro' (default): only the body between the heading "
+               "and its first child heading. Child sub-sections are preserved "
+               "— the safe, common case.\n"
+               "  - scope='section': the whole section including all child "
+               "sub-sections. operation='replace' here wipes the children and "
+               "requires confirm_wipe=true.\n"
+               "Heading edits use local markdown parsing (not the REST heading "
+               "matcher), so they are reliable for non-ASCII / CJK headings.\n\n"
                "Note: target_type='block' requires a pre-existing block "
                "reference (^block-id) in the file. target_type='frontmatter' "
                "requires the field to be defined in the YAML frontmatter — "
-               "both are rare in practice.\n\n"
-               "Obsidian REST quirk: heading matching is server-side and "
-               "non-ASCII headings (Korean, emoji, etc.) sometimes fail "
-               "silently. If a heading appears in obsidian_list_headings "
-               "but patch fails, copy the title verbatim from list_headings "
-               "output, or use obsidian_section_intro_patch which uses "
-               "local parsing instead."
+               "both are rare in practice and go through the REST API."
            ),
            inputSchema={
                "type": "object",
@@ -402,13 +406,26 @@ class PatchContentToolHandler(ToolHandler):
                        "type": "string",
                        "description": "Content to insert"
                    },
+                   "scope": {
+                       "type": "string",
+                       "description": (
+                           "Only for target_type='heading'. 'intro' (default): "
+                           "edit only the body before the first child heading, "
+                           "preserving sub-sections. 'section': edit the whole "
+                           "section including children (replace wipes them, "
+                           "needs confirm_wipe). Ignored for block/frontmatter."
+                       ),
+                       "enum": ["intro", "section"],
+                       "default": "intro"
+                   },
                    "confirm_wipe": {
                        "type": "boolean",
                        "description": (
-                           "Required only when target_type='heading' and "
-                           "operation='replace' AND the target heading has "
-                           "child sub-headings. Set true to acknowledge that "
-                           "all descendants will be wiped. Otherwise omit."
+                           "Required only when target_type='heading', "
+                           "scope='section', operation='replace' AND the target "
+                           "heading has child sub-headings. Set true to "
+                           "acknowledge that all descendants will be wiped. "
+                           "Otherwise omit."
                        ),
                        "default": False
                    }
@@ -427,72 +444,77 @@ class PatchContentToolHandler(ToolHandler):
        target = args["target"]
        content = args["content"]
        confirm_wipe = args.get("confirm_wipe", False)
+       scope = args.get("scope", "intro")
 
-       # L4 leniency: normalize heading path segments only (block/frontmatter untouched)
+       api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
+
+       # --- Heading: edited locally (parse + put_content). Reliable for
+       # non-ASCII headings and fails loudly instead of the REST matcher's
+       # silent corruption. block/frontmatter still use the REST PATCH below. ---
        if target_type == "heading":
+           if scope not in ("intro", "section"):
+               raise RuntimeError(f"invalid scope {scope!r}; must be 'intro' or 'section'")
+
            target = "::".join(
                markdown_section.normalize_heading_path(seg)
                for seg in target.split("::")
            )
+           file_text = api.get_file_contents(filepath)
 
-       api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
-
-       # L4 path resolution: convert partial / single-name heading paths to the
-       # full root-anchored path that Obsidian REST requires. Same GET as the
-       # confirm_wipe gate — cache and reuse.
-       file_text_cache = None
-       if target_type == "heading":
-           file_text_cache = api.get_file_contents(filepath)
+           # Resolve target level once (None if missing/ambiguous — the apply
+           # op below re-raises with the healing tree).
            try:
-               target = markdown_section.resolve_to_full_path(file_text_cache, target)
+               level = markdown_section.heading_level(file_text, target)
            except ValueError:
-               # Path not found / ambiguous — let the server fail and trigger
-               # the healing branch below for a consistent error format.
-               pass
+               level = None
 
-       # L2+L4 confirm_wipe gate — only when heading + replace + has children
-       n_wiped = 0
-       if target_type == "heading" and operation == "replace":
-           # file_text_cache already populated above
-           try:
-               if markdown_section.heading_has_children(file_text_cache, target):
-                   n_wiped = markdown_section.count_descendant_headings(file_text_cache, target)
+           # Guard: a heading line in `content` at the target's level or
+           # shallower creates a duplicate/sibling, since the heading line is
+           # never replaced.
+           if level is not None:
+               lead = markdown_section.leading_heading_level(content)
+               if lead is not None and lead <= level:
+                   raise RuntimeError(
+                       f"content starts with a level-{lead} heading, but this "
+                       f"operation edits only the body — the heading line is "
+                       f"never changed — so it would create a duplicate/sibling "
+                       f"heading. To rename the heading use obsidian_rename_heading; "
+                       f"for a real sub-section use a deeper heading level."
+                   )
+
+           # confirm_wipe gate — only scope='section' replace that wipes children
+           n_wiped = 0
+           if scope == "section" and operation == "replace" and level is not None:
+               if markdown_section.heading_has_children(file_text, target):
+                   n_wiped = markdown_section.count_descendant_headings(file_text, target)
                    if not confirm_wipe:
                        raise RuntimeError(
                            f"Heading {target!r} in {filepath} has {n_wiped} "
-                           f"descendant heading(s). Operation 'replace' would wipe them all.\n"
+                           f"descendant heading(s). scope='section' replace would "
+                           f"wipe them all.\n"
                            f"  - If intentional, retry with confirm_wipe=true.\n"
-                           f"  - If you only want to update the intro (preserving "
-                           f"children), use obsidian_section_intro_patch with "
-                           f"operation='replace' instead."
+                           f"  - To replace only the body and keep sub-sections, "
+                           f"use scope='intro' (the default)."
                        )
-           except ValueError:
-               # Heading path not found / ambiguous — same fall-through logic.
-               pass
 
-       try:
-           api.patch_content(filepath, operation, target_type, target, content)
-       except Exception as e:
-           # L6 healing: heading-related failures get the file's heading tree appended
-           if target_type == "heading":
-               if file_text_cache is None:
-                   try:
-                       file_text_cache = api.get_file_contents(filepath)
-                   except Exception:
-                       raise e
-               tree = "\n".join(markdown_section.heading_tree_lines(file_text_cache))
-               raise RuntimeError(
-                   f"{e}\n\nAvailable headings in {filepath}:\n{tree}"
-               )
-           raise
+           try:
+               if scope == "intro":
+                   new_text = markdown_section.apply_intro_op(file_text, target, operation, content)
+               else:
+                   new_text = markdown_section.apply_section_op(file_text, target, operation, content)
+           except ValueError as e:
+               tree = "\n".join(markdown_section.heading_tree_lines(file_text))
+               raise RuntimeError(f"{e}\n\nAvailable headings in {filepath}:\n{tree}")
 
-       success_msg = f"Successfully patched content in {filepath}"
-       if n_wiped > 0:
-           success_msg += f" (wiped {n_wiped} child heading(s))"
+           api.put_content(filepath, new_text)
+           success_msg = f"Successfully patched content in {filepath} (heading, scope={scope})"
+           if n_wiped > 0:
+               success_msg += f" (wiped {n_wiped} child heading(s))"
+           return [TextContent(type="text", text=success_msg)]
 
-       return [
-           TextContent(type="text", text=success_msg)
-       ]
+       # --- block / frontmatter: server-side PATCH (unchanged) ---
+       api.patch_content(filepath, operation, target_type, target, content)
+       return [TextContent(type="text", text=f"Successfully patched content in {filepath}")]
        
 class PutContentToolHandler(ToolHandler):
    def __init__(self):
@@ -534,32 +556,26 @@ class PutContentToolHandler(ToolHandler):
        ]
    
 
-class SectionIntroPatchToolHandler(ToolHandler):
-   """Surgical edit on a heading's intro region — content between the heading
-   line and its first child heading. Child headings (and everything below
-   them) are NEVER touched. Avoids the destructive subtree-wipe of
-   `obsidian_patch_content` with `target_type=heading, operation=replace`.
-
-   Use this for "update one inline value under a section that has child
-   subsections" — e.g. updating a timestamp directly under H1 while
-   preserving H2 child sections.
+class RenameHeadingToolHandler(ToolHandler):
+   """Rename a heading: change the heading line's text while keeping its level
+   and everything beneath it (body + sub-sections) intact. Local parsing, so
+   reliable for non-ASCII headings.
    """
    def __init__(self):
-       super().__init__("obsidian_section_intro_patch")
+       super().__init__("obsidian_rename_heading")
 
    def get_tool_description(self):
        return Tool(
            name=self.name,
            description=(
-               "PREFERRED tool for editing under any heading. Edits only the "
-               "INTRO region (lines between the heading line and its first "
-               "child heading) — child sub-headings are preserved. Use this "
-               "whenever the target heading has children, instead of "
-               "obsidian_patch_content (heading, replace) which would wipe "
-               "them.\n\n"
-               "heading_path uses '::' delimiter and is lenient — leading "
-               "'#' and whitespace per segment are stripped, so '## Sub' and "
-               "'Sub' both work. On miss or ambiguity, the file's heading "
+               "Rename a heading — change the heading line's TEXT while keeping "
+               "its level and everything under it (body + sub-sections) intact. "
+               "Use this instead of trying to 'replace' a heading via "
+               "obsidian_patch_content, which only edits the body and would "
+               "leave the old heading plus a duplicate.\n\n"
+               "Local markdown parsing — reliable for non-ASCII / CJK headings. "
+               "heading_path uses '::' delimiter and is lenient (leading '#' / "
+               "whitespace stripped). On miss or ambiguity the file's heading "
                "tree is returned in the error for self-correction."
            ),
            inputSchema={
@@ -573,38 +589,28 @@ class SectionIntroPatchToolHandler(ToolHandler):
                    "heading_path": {
                        "type": "string",
                        "description": (
-                           "'::'-delimited heading path identifying the target "
-                           "heading. e.g. 'My H1' or 'My H1::My H2'. Lenient — "
-                           "leading '#' and whitespace per segment are stripped. "
-                           "Path must resolve to exactly one heading."
+                           "'::'-delimited path to the heading to rename. e.g. "
+                           "'My H1' or 'My H1::My H2'. Lenient. Must resolve to "
+                           "exactly one heading."
                        )
                    },
-                   "operation": {
+                   "new_title": {
                        "type": "string",
                        "description": (
-                           "append: insert at end of intro (just before first "
-                           "child heading). prepend: insert at top of intro "
-                           "(right after heading line). replace: overwrite the "
-                           "intro region (children remain intact)."
-                       ),
-                       "enum": ["append", "prepend", "replace"]
-                   },
-                   "content": {
-                       "type": "string",
-                       "description": "Markdown content to insert/overwrite."
+                           "New heading text, WITHOUT leading '#'. The heading "
+                           "level is preserved automatically."
+                       )
                    }
                },
-               "required": ["filepath", "heading_path", "operation", "content"]
+               "required": ["filepath", "heading_path", "new_title"]
            }
        )
 
    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
-       required = ["filepath", "heading_path", "operation", "content"]
-       missing = [k for k in required if k not in args]
-       if missing:
-           raise RuntimeError(f"Missing required arguments: {', '.join(missing)}")
+       for k in ("filepath", "heading_path", "new_title"):
+           if k not in args:
+               raise RuntimeError(f"{k} argument required")
 
-       # L4 leniency: normalize heading path segments
        heading_path = "::".join(
            markdown_section.normalize_heading_path(seg)
            for seg in args["heading_path"].split("::")
@@ -614,29 +620,108 @@ class SectionIntroPatchToolHandler(ToolHandler):
        text = api.get_file_contents(args["filepath"])
 
        try:
-           new_text = markdown_section.apply_intro_op(
-               text,
-               heading_path=heading_path,
-               operation=args["operation"],
-               content=args["content"],
-           )
+           new_text = markdown_section.rename_heading(text, heading_path, args["new_title"])
        except ValueError as e:
-           # L6 healing: append heading tree so the agent can self-correct
            tree = "\n".join(markdown_section.heading_tree_lines(text))
            raise RuntimeError(
                f"{e}\n\nAvailable headings in {args['filepath']}:\n{tree}"
            )
 
        api.put_content(args["filepath"], new_text)
-
+       new_title = markdown_section.normalize_heading_path(args["new_title"])
        return [
            TextContent(
                type="text",
-               text=(
-                   f"Successfully patched intro of heading "
-                   f"{heading_path!r} in {args['filepath']} "
-                   f"(operation={args['operation']})"
-               )
+               text=f"Renamed heading {heading_path!r} -> {new_title!r} in {args['filepath']}"
+           )
+       ]
+
+
+class DeleteSectionToolHandler(ToolHandler):
+   """Delete a heading and its entire section (body + descendants) in place.
+   Local parsing; gated by an explicit confirm flag because it is destructive.
+   """
+   def __init__(self):
+       super().__init__("obsidian_delete_section")
+
+   def get_tool_description(self):
+       return Tool(
+           name=self.name,
+           description=(
+               "DESTRUCTIVE. Remove a heading and its ENTIRE section (body plus "
+               "all descendant sub-sections) from a file. Requires confirm=true. "
+               "Use for deleting one section in place — NOT the whole file "
+               "(that is obsidian_delete_file).\n\n"
+               "Local markdown parsing — reliable for non-ASCII headings. "
+               "heading_path is lenient. On miss or ambiguity the heading tree "
+               "is returned in the error. If confirm is omitted, the call is "
+               "rejected with a count of what would be removed."
+           ),
+           inputSchema={
+               "type": "object",
+               "properties": {
+                   "filepath": {
+                       "type": "string",
+                       "description": "Path to the file (relative to vault root)",
+                       "format": "path"
+                   },
+                   "heading_path": {
+                       "type": "string",
+                       "description": (
+                           "'::'-delimited path to the heading whose section "
+                           "will be removed. Lenient. Must resolve to exactly "
+                           "one heading."
+                       )
+                   },
+                   "confirm": {
+                       "type": "boolean",
+                       "description": (
+                           "Must be exactly true. Deliberate confirmation that "
+                           "the heading, its body, and all sub-sections are "
+                           "deleted."
+                       ),
+                       "enum": [True]
+                   }
+               },
+               "required": ["filepath", "heading_path", "confirm"]
+           }
+       )
+
+   def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+       for k in ("filepath", "heading_path"):
+           if k not in args:
+               raise RuntimeError(f"{k} argument required")
+
+       heading_path = "::".join(
+           markdown_section.normalize_heading_path(seg)
+           for seg in args["heading_path"].split("::")
+       )
+
+       api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
+       text = api.get_file_contents(args["filepath"])
+
+       try:
+           n_desc = markdown_section.count_descendant_headings(text, heading_path)
+       except ValueError as e:
+           tree = "\n".join(markdown_section.heading_tree_lines(text))
+           raise RuntimeError(
+               f"{e}\n\nAvailable headings in {args['filepath']}:\n{tree}"
+           )
+
+       if args.get("confirm", False) is not True:
+           raise RuntimeError(
+               f"Deleting section {heading_path!r} would remove the heading and "
+               f"{n_desc} descendant heading(s) plus all their content. Retry "
+               f"with confirm=true to proceed."
+           )
+
+       new_text = markdown_section.delete_section(text, heading_path)
+       api.put_content(args["filepath"], new_text)
+       suffix = f" ({n_desc} sub-heading(s) included)" if n_desc else ""
+       return [
+           TextContent(
+               type="text",
+               text=f"Deleted section {heading_path!r} from {args['filepath']}{suffix}"
            )
        ]
 
@@ -653,11 +738,12 @@ class DeleteFileToolHandler(ToolHandler):
                "directory from the vault. Use ONLY when the user explicitly "
                "requests deletion of a specific file.\n\n"
                "DO NOT use as a workaround when a write operation fails — "
-               "instead use obsidian_section_intro_patch (preferred for "
-               "heading edits) or obsidian_patch_content. "
-               "DO NOT use to 'replace' a file's content — use "
-               "obsidian_append_content (creates if missing) or rewrite via "
-               "section_intro_patch."
+               "instead use obsidian_patch_content (heading edits default to "
+               "scope='intro', preserving children). To remove just one "
+               "section, use obsidian_delete_section rather than deleting the "
+               "whole file. DO NOT use to 'replace' a file's content — use "
+               "obsidian_append_content (creates if missing) or a scoped "
+               "obsidian_patch_content edit."
            ),
            inputSchema={
                "type": "object",
@@ -947,12 +1033,12 @@ class ListHeadingsToolHandler(ToolHandler):
             name=self.name,
             description=(
                 "Returns the heading tree of a single file as an indented "
-                "outline. Use BEFORE calling obsidian_patch_content / "
-                "obsidian_section_intro_patch when unsure of exact heading "
-                "path. Cheap recon — typically 1-5% of file token cost. "
-                "On heading-related errors from patch tools, the failing "
-                "tool already returns the tree in its error message; this "
-                "dedicated tool is for proactive lookup."
+                "outline. Use BEFORE calling obsidian_patch_content, "
+                "obsidian_rename_heading, or obsidian_delete_section when "
+                "unsure of the exact heading path. Cheap recon — typically "
+                "1-5% of file token cost. On heading-related errors from those "
+                "tools, the failing tool already returns the tree in its error "
+                "message; this dedicated tool is for proactive lookup."
             ),
             inputSchema={
                 "type": "object",

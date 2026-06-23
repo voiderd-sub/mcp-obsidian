@@ -149,6 +149,24 @@ def intro_region(text: str, heading_path: str) -> tuple[int, int, list[str]]:
     return start_idx, end_idx, lines
 
 
+def _join_lines(parts: list[str]) -> str:
+    """Join line fragments, guaranteeing a newline between adjacent fragments.
+
+    `splitlines(keepends=True)` leaves only the file's final line without a
+    trailing newline. When a splice moves that line into the middle (e.g.
+    append into a section whose body had no trailing newline), a plain
+    ``"".join`` would glue it onto the next fragment. This inserts the missing
+    separator. The final fragment keeps its original ending.
+    """
+    out: list[str] = []
+    n = len(parts)
+    for i, p in enumerate(parts):
+        out.append(p)
+        if i < n - 1 and not p.endswith("\n"):
+            out.append("\n")
+    return "".join(out)
+
+
 def apply_intro_op(text: str, heading_path: str, operation: str, content: str) -> str:
     """Apply append/prepend/replace to the intro region of the target heading.
 
@@ -167,7 +185,7 @@ def apply_intro_op(text: str, heading_path: str, operation: str, content: str) -
     else:  # prepend
         new_intro_lines = [content] + lines[start_idx:end_idx]
 
-    return "".join(lines[:start_idx] + new_intro_lines + lines[end_idx:])
+    return _join_lines(lines[:start_idx] + new_intro_lines + lines[end_idx:])
 
 
 # ----------------------------------------------------------- harness helpers
@@ -179,8 +197,8 @@ _LEADING_HASH_RE = re.compile(r"^\s*#+\s*")
 def normalize_heading_path(raw: str) -> str:
     """Strip leading `#+\\s*`, trailing `#*\\s*`, and surrounding whitespace.
 
-    Operates on a single `::` segment. Idempotent. Used by patch_content /
-    section_intro_patch leniency: `'## Architecture'` -> `'Architecture'`,
+    Operates on a single `::` segment. Idempotent. Used by patch_content and
+    the heading-tool leniency: `'## Architecture'` -> `'Architecture'`,
     `'  Sub  '` -> `'Sub'`, `'Foo ##'` -> `'Foo'`.
     """
     s = _LEADING_HASH_RE.sub("", raw)
@@ -314,3 +332,87 @@ def count_descendant_headings(text: str, heading_path: str) -> int:
             break
         n += 1
     return n
+
+
+def apply_section_op(text: str, heading_path: str, operation: str, content: str) -> str:
+    """Apply append/prepend/replace to the WHOLE section of the target heading.
+
+    Unlike `apply_intro_op` (intro region only), this spans the entire section
+    — the heading line is preserved, but the body **and all descendant
+    sub-sections** are the editable region. `replace` therefore wipes child
+    sub-headings; the caller should gate it (confirm) when children exist.
+
+    Returns the new full file text.
+    """
+    if operation not in {"append", "prepend", "replace"}:
+        raise ValueError(f"unknown operation: {operation!r}")
+    start_idx, end_idx, lines = section_region(text, heading_path)
+    if not content.endswith("\n"):
+        content = content + "\n"
+
+    body_start = start_idx + 1  # first line after the heading line
+
+    if operation == "replace":
+        new_lines = lines[:body_start] + [content] + lines[end_idx:]
+    elif operation == "append":
+        new_lines = lines[:end_idx] + [content] + lines[end_idx:]
+    else:  # prepend
+        new_lines = lines[:body_start] + [content] + lines[body_start:]
+
+    return _join_lines(new_lines)
+
+
+def rename_heading(text: str, heading_path: str, new_title: str) -> str:
+    """Replace the target heading's title text, preserving its level.
+
+    Only the heading line itself changes — body and descendant sub-sections are
+    untouched. `new_title` is normalized (leading `#` / whitespace stripped).
+    Raises ValueError on empty title, multi-line title, or unresolved path.
+    """
+    new_title = normalize_heading_path(new_title)
+    if not new_title:
+        raise ValueError("new_title is empty after normalization")
+    if "\n" in new_title:
+        raise ValueError("new_title must be a single line")
+
+    lines = text.splitlines(keepends=True)
+    headings = _scan_headings(lines)
+    target = _resolve_heading_path(headings, heading_path)
+
+    original = lines[target.line_idx]
+    newline = "\n" if original.endswith("\n") else ""
+    lines[target.line_idx] = f"{'#' * target.level} {new_title}{newline}"
+    return "".join(lines)
+
+
+def delete_section(text: str, heading_path: str) -> str:
+    """Remove the target heading line and its entire section (intro + all
+    descendant sub-sections). Returns the new full file text.
+    """
+    start_idx, end_idx, lines = section_region(text, heading_path)
+    return "".join(lines[:start_idx] + lines[end_idx:])
+
+
+def heading_level(text: str, heading_path: str) -> int:
+    """Return the level (1-6) of the heading resolved by `heading_path`.
+
+    Raises ValueError (via `_resolve_heading_path`) on miss / ambiguity.
+    """
+    headings = _scan_headings(text.splitlines(keepends=True))
+    return _resolve_heading_path(headings, heading_path).level
+
+
+def leading_heading_level(content: str) -> int | None:
+    """Level of the first non-empty line of `content` if it is an ATX heading,
+    else None.
+
+    Used to guard body-editing operations against an accidentally injected
+    heading line (which would create a duplicate / sibling heading, since the
+    edit never touches the target's own heading line).
+    """
+    for line in content.splitlines():
+        if not line.strip():
+            continue
+        m = _ATX_RE.match(line)
+        return len(m.group(1)) if m else None
+    return None

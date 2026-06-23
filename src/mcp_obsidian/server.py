@@ -50,7 +50,10 @@ add_tool_handler(tools.PatchContentToolHandler())
 add_tool_handler(tools.AppendContentToolHandler())
 # PutContentToolHandler intentionally not registered — append/patch cover its use cases
 # add_tool_handler(tools.PutContentToolHandler())
-add_tool_handler(tools.SectionIntroPatchToolHandler())
+# SectionIntroPatchToolHandler removed — its intro-edit behavior is now
+# patch_content(target_type=heading, scope=intro), which is the default.
+add_tool_handler(tools.RenameHeadingToolHandler())
+add_tool_handler(tools.DeleteSectionToolHandler())
 add_tool_handler(tools.ListHeadingsToolHandler())
 add_tool_handler(tools.DeleteFileToolHandler())
 add_tool_handler(tools.ComplexSearchToolHandler())

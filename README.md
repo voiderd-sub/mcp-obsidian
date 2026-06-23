@@ -15,19 +15,24 @@ Reshaping was driven by [Anthropic's "Writing tools for agents"](https://www.ant
 
 ### Safety gates
 
-- **`patch_content (heading, replace)` is gated when the target heading has children.** Without `confirm_wipe=true`, the call is rejected with a redirect to `section_intro_patch`. This eliminates the most common destructive accident: replacing a heading's intro and silently wiping all sub-sections.
-- **`delete_file` description and schema reflect that it is destructive and irreversible.** `confirm` is now an enum `[true]` so accidental defaults can't fire it. The description explicitly tells the agent not to use it as a workaround for failed writes.
+- **`patch_content (heading)` defaults to `scope='intro'`** — it edits only the body before the first child heading, so sub-sections are preserved by default. The destructive whole-section replace is `scope='section'`, and when the heading has children it additionally requires `confirm_wipe=true`. The common case is safe by construction; the destructive case is explicit.
+- **The heading line is never touched by a content edit, and the tool enforces it.** A `content` body that starts with a heading at the target's level or shallower is rejected (it would create a duplicate), with a pointer to `rename_heading`.
+- **`delete_file` and `delete_section` are destructive and gated.** `confirm` is an enum `[true]` so accidental defaults can't fire them. `delete_file` removes a whole file; `delete_section` removes one heading's section in place. Both descriptions tell the agent not to use deletion as a workaround for a failed write.
 
 ### Heading-path leniency + healing
 
-- **`patch_content` and `section_intro_patch` accept lenient heading paths.** Leading `#` and whitespace per segment are stripped, and partial paths like `Sub` or `Sub::Leaf` are auto-resolved to the full root-anchored path if the match is unique. Agents no longer need to construct `Top H1::Sub H2` from scratch.
+- **All heading tools accept lenient heading paths** (`patch_content`, `rename_heading`, `delete_section`). Leading `#` and whitespace per segment are stripped, and partial paths like `Sub` or `Sub::Leaf` are auto-resolved if the match is unique. Agents no longer need to construct `Top H1::Sub H2` from scratch.
 - **On heading-path miss or ambiguity, the file's heading tree is appended to the error.** The agent gets the data it needs to self-correct on the next call instead of looping or escalating to deletion.
+- **Heading edits are done by local markdown parsing, not the REST heading matcher.** `patch_content(heading)`, `rename_heading`, and `delete_section` read the file, edit it in-process, and `put` the result. This avoids the upstream `markdown-patch` failure mode where a non-ASCII / nested heading match silently fails and a duplicate heading is appended ([local-rest-api #83](https://github.com/coddingtonbear/obsidian-local-rest-api/issues/83), [mcp-tools #71](https://github.com/jacksteamdev/obsidian-mcp-tools/issues/71)). Local parsing fails loudly with the heading tree instead. `block` / `frontmatter` targets still use the REST PATCH.
 
 ### New tools
 
-- **`section_intro_patch`** — surgical edit of a heading's intro region (between the heading and its first child). Children are preserved. Marked PREFERRED in description for editing under any heading with children.
+- **`rename_heading`** — change a heading line's text while preserving its level and everything beneath it. The clean path for renaming, instead of misusing `patch_content` replace (which only edits the body and would leave a duplicate).
+- **`delete_section`** — remove a heading and its entire section (body + descendants) in place. Destructive, `confirm: true` required. Distinct from `delete_file` (whole file).
 - **`list_headings`** — returns the heading tree of a single file as an indented outline. Cheap proactive recon before patching, typically 1–5% of full-file token cost.
 - **`get_section_content`** — returns the content under a single heading (heading line + body + descendants). Replaces full-file reads when only one section is needed.
+
+> The previous `section_intro_patch` tool was folded into `patch_content(target_type='heading', scope='intro')` — which is now the default — so there is one consistently-named content-edit surface instead of two overlapping ones.
 
 ### Token efficiency
 
@@ -39,7 +44,7 @@ Reshaping was driven by [Anthropic's "Writing tools for agents"](https://www.ant
 
 ### Removed / restricted
 
-- `put_content` (full-file overwrite) is intentionally **not registered**. Use `append_content` (creates if missing) or `section_intro_patch` instead. Removing the surface eliminates the "rewrite the whole file" misuse pattern.
+- `put_content` (full-file overwrite) is intentionally **not registered** as an agent-facing tool. Use `append_content` (creates if missing) or a scoped `patch_content` edit instead. Removing the surface eliminates the "rewrite the whole file" misuse pattern. (Internally, the local heading tools use `put` to write back the parsed-and-edited file — that path computes the exact bytes from a surgical instruction, so it is not the same clobber risk.)
 - `get_periodic_note`, `get_recent_periodic_notes`, and `get_recent_changes` are **not registered** — the periodic-note workflow (daily/weekly/monthly/quarterly/yearly notes) and ad-hoc "recent changes" lookups are unused in this harness. All three classes remain in `tools.py`; re-enable by uncommenting one line in `server.py`.
 - `complex_search` description trimmed (examples were duplicated between the body and the parameter description).
 
@@ -61,9 +66,10 @@ Reshaping was driven by [Anthropic's "Writing tools for agents"](https://www.ant
 - **simple_search** — Text search across the vault, `limit`-truncated.
 - **complex_search** — JsonLogic search (glob, regexp on path/content), `limit`-truncated.
 - **append_content** — Appends content to a file (creates if missing).
-- **patch_content** — Inserts content relative to a heading / block ref / frontmatter field. Lenient heading paths, healing on miss, `confirm_wipe` gate on destructive `(heading, replace)` calls.
-- **section_intro_patch** — Surgical edit of a heading's intro region only. Preserves child sub-headings. **Preferred** for any edit under a heading with children.
-- **delete_file** — Permanently removes a file. `confirm: true` required. Use only on explicit user request.
+- **patch_content** — Inserts/replaces content relative to a heading / block ref / frontmatter field. For headings: local parsing, `scope` of `intro` (default, preserves children) or `section`, lenient paths, healing on miss, `confirm_wipe` gate on destructive `(section, replace)` calls, and rejection of heading lines injected into the body.
+- **rename_heading** — Changes a heading line's text, preserving its level and everything below it.
+- **delete_section** — Removes a heading and its entire section (body + descendants). `confirm: true` required.
+- **delete_file** — Permanently removes a whole file. `confirm: true` required. Use only on explicit user request.
 
 ### Example prompts
 
